@@ -23,7 +23,7 @@ Blue Kik Parser is a Python-based tool designed to extract messages, images, and
 ## Installation
 1. Clone the repository:
    ```sh
-   git clone https://github.com/your-repo/blue-kik-parser.git
+   git clone https://github.com/marcuspenn4n6/Blue-Kik-Parser/blue-kik-parser.git
    cd blue-kik-parser
    ```
 2. Install dependencies:
