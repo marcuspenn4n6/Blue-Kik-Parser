@@ -4,6 +4,8 @@ import argparse
 import logging
 from datetime import datetime, timezone
 import os
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment
 
 # Configure logging with debug level
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,7 +25,9 @@ parser.add_argument('database', type=str, help='Path to the SQLite database file
 args = parser.parse_args()
 
 # Generate output filename based on database argument
-output_file = f"Blue Kik Parsed - {os.path.basename(args.database)}.xlsx"
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+output_file = os.path.join(os.path.dirname(args.database),
+                           f"Blue Kik Parsed - {os.path.basename(args.database)} - {timestamp}.xlsx")
 
 # Connect to the SQLite database
 logging.debug(f"Connecting to database: {args.database}")
@@ -37,38 +41,58 @@ def column_exists(table, column):
     logging.debug(f"Columns in {table}: {columns}")
     return column in columns
 
-# Ensure partner_jid exists in messagesTable
-partner_jid_column = "partner_jid" if column_exists("messagesTable", "partner_jid") else None
-if not partner_jid_column:
-    logging.error("Required column 'partner_jid' not found in messagesTable. Exiting.")
+# Ensure bin_id exists in messagesTable
+bin_id_column = "bin_id" if column_exists("messagesTable", "bin_id") else None
+if not bin_id_column:
+    logging.error("Required column 'bin_id' not found in messagesTable. Exiting.")
     exit(1)
 
 queries = {
-    "Private Messages": f"""
-        SELECT CASE WHEN was_me = 1 THEN 'account owner' ELSE {partner_jid_column} END AS sender, 
-               body, timestamp, was_me
-        FROM messagesTable
-        WHERE {partner_jid_column} NOT IN (SELECT group_id FROM memberTable)
+    "Private Messages": """
+        SELECT m._id, m.bin_id, m.timestamp, 
+               CASE WHEN m.was_me = 1 THEN 'account owner' ELSE m.partner_jid END AS sender, 
+               COALESCE(m.body, '[No Text]') AS body, 
+               m.stat_msg, m.stat_user_jid, 
+               m.content_id, kc.content_name, ku.content_uri, ai.image_id, 
+               m.friend_attr_id, m.was_me
+        FROM messagesTable m
+        LEFT JOIN KIKContentTable kc ON m.content_id = kc.content_id
+        LEFT JOIN KIKContentURITable ku ON m.content_id = ku.content_id
+        LEFT JOIN AccountSwitcherImgBackupTable ai ON kc.content_string = ai.image_id
+        WHERE m.bin_id LIKE '%@talk.kik.com' 
+        AND (kc.content_name = 'preview' OR kc.content_name IS NULL);
     """,
-    "Group Messages": f"""
-        SELECT memberTable.group_id, 
-               CASE WHEN messagesTable.was_me = 1 THEN 'account owner' ELSE messagesTable.{partner_jid_column} END AS sender, 
-               COALESCE(messagesTable.body, '[No Text]') AS body, messagesTable.timestamp, messagesTable.was_me
-        FROM messagesTable
-        JOIN memberTable ON messagesTable.bin_id = memberTable.group_id
-        WHERE memberTable.group_id IS NOT NULL
+
+    "Group Messages": """
+        SELECT m._id, m.bin_id, m.timestamp, 
+               CASE WHEN m.was_me = 1 THEN 'account owner' ELSE m.partner_jid END AS sender, 
+               COALESCE(m.body, '[No Text]') AS body, 
+               m.stat_msg, m.stat_user_jid, 
+               m.content_id, kc.content_name, ku.content_uri, ai.image_id, 
+               m.friend_attr_id, m.was_me
+        FROM messagesTable m
+        LEFT JOIN KIKContentTable kc ON m.content_id = kc.content_id
+        LEFT JOIN KIKContentURITable ku ON m.content_id = ku.content_id
+        LEFT JOIN AccountSwitcherImgBackupTable ai ON kc.content_string = ai.image_id
+        WHERE m.bin_id LIKE '%@groups.kik.com' 
+        AND (kc.content_name = 'preview' OR kc.content_name IS NULL);
     """,
-    "Images & Content": f"""
-        SELECT CASE WHEN messagesTable.was_me = 1 THEN 'account owner' ELSE messagesTable.{partner_jid_column} END AS sender, 
-               messagesTable.content_id, KIKContentTable.content_name, KIKContentURITable.content_uri, 
-               AccountSwitcherImgBackupTable.image_id, messagesTable.was_me, 
-               KIKContentRetainCountTable.retain_count
-        FROM messagesTable
-        LEFT JOIN KIKContentTable ON messagesTable.content_id = KIKContentTable.content_id
-        LEFT JOIN KIKContentURITable ON messagesTable.content_id = KIKContentURITable.content_id
-        LEFT JOIN AccountSwitcherImgBackupTable ON KIKContentTable.content_string = AccountSwitcherImgBackupTable.image_id
-        LEFT JOIN KIKContentRetainCountTable ON messagesTable.content_id = KIKContentRetainCountTable.content_id
-        WHERE AccountSwitcherImgBackupTable.image_id IS NOT NULL AND KIKContentURITable.content_uri IS NULL
+
+    "Images": """
+        SELECT CASE WHEN m.was_me = 1 THEN 'account owner' ELSE m.partner_jid END AS sender, 
+               m.content_id, kc.content_name, ku.content_uri, ai.image_id, 
+               kr.retain_count, m.was_me
+        FROM messagesTable m
+        LEFT JOIN KIKContentTable kc ON m.content_id = kc.content_id
+        LEFT JOIN KIKContentURITable ku ON m.content_id = ku.content_id
+        LEFT JOIN AccountSwitcherImgBackupTable ai ON kc.content_string = ai.image_id
+        LEFT JOIN KIKContentRetainCountTable kr ON m.content_id = kr.content_id
+        WHERE m.bin_id LIKE '%@talk.kik.com' 
+        AND kc.content_name NOT IN (
+            'icon', 'app-name', 'file-name', 'file-size', 'int-file-url-local', 
+            'int-file-state', 'int-chunk-progress', 'file-url', 'sha1-scaled', 
+            'blockhash-scaled', 'sha1-original', 'allow-forward'
+        );
     """
 }
 
@@ -94,4 +118,27 @@ with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
 logging.debug("Closing database connection.")
 cursor.close()
 conn.close()
+
+# Apply column width formatting
+wb = load_workbook(output_file)
+column_widths = {
+    '_id': 10, 'bin_id': 25, 'timestamp': 20, 'sender': 30, 'body': 100,
+    'stat_msg': 20, 'stat_user_jid': 30, 'content_id': 20, 'content_name': 30,
+    'content_uri': 50, 'image_id': 20, 'friend_attr_id': 20, 'was_me': 10,
+    'retain_count': 15
+}
+
+for sheet in wb.sheetnames:
+    ws = wb[sheet]
+    for col in ws.iter_cols(1, ws.max_column):
+        col_letter = col[0].column_letter
+        col_name = col[0].value
+        if col_name in column_widths:
+            ws.column_dimensions[col_letter].width = column_widths[col_name]
+            for cell in col:
+                cell.alignment = Alignment(wrap_text=True, vertical='top')
+    # Enable autofilter for all columns
+    ws.auto_filter.ref = ws.dimensions
+    wb.save(output_file)
+
 logging.info(f"Enhanced data export completed: {output_file}")
