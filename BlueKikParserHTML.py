@@ -2,146 +2,202 @@ import sqlite3
 import pandas as pd
 import logging
 import os
+import sys
 import argparse
+import json
+import csv
+from jinja2 import Environment
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description="Generate an HTML report from a Kik backup database.")
-parser.add_argument("db_path", help="Path to the SQLite database file")
-parser.add_argument("image_folder", help="Path to the folder containing images")
-args = parser.parse_args()
-
-# Database and Output Paths
-DB_PATH = args.db_path
-IMAGE_FOLDER = args.image_folder
-OUTPUT_HTML = os.path.join(os.path.dirname(DB_PATH), os.path.splitext(os.path.basename(DB_PATH))[0] + "_Report.html")
-
-# SQL Queries
-# SQL Queries
 QUERIES = {
     "Private Messages": """
-        SELECT m._id, m.bin_id, DATETIME(m.timestamp / 1000, 'unixepoch') AS timestamp, 
-               CASE WHEN m.was_me = 1 THEN 'account owner' ELSE m.partner_jid END AS sender, 
-               COALESCE(m.body, '[No Text]') AS body, 
-               m.content_id, COALESCE(ai.image_id, kc.content_string) AS image_id
+        SELECT m._id, m.bin_id, DATETIME(m.timestamp / 1000, 'unixepoch') AS timestamp,
+               CASE WHEN m.was_me = 1 THEN 'account owner' ELSE m.partner_jid END AS sender,
+               COALESCE(m.body, '[No Text]') AS body,
+               m.content_id, kc.content_name, ku.content_uri,
+               kc.content_string AS image_id
         FROM messagesTable m
-        LEFT JOIN AccountSwitcherImgBackupTable ai ON m.content_id = ai.image_id
-        LEFT JOIN KIKContentTable kc ON m.content_id = kc.content_id  -- Corrected join
-        WHERE m.bin_id LIKE '%@talk.kik.com';
+        LEFT JOIN KIKContentTable kc ON m.content_id = kc.content_id
+        LEFT JOIN KIKContentURITable ku ON m.content_id = ku.content_id
+        WHERE m.bin_id LIKE '%@talk.kik.com'
+        AND (kc.content_name = 'preview' OR kc.content_name IS NULL);
     """,
-
     "Group Messages": """
-        SELECT m._id, m.bin_id, m.timestamp, 
-               CASE WHEN m.was_me = 1 THEN 'account owner' ELSE m.partner_jid END AS sender, 
-               COALESCE(m.body, '[No Text]') AS body, 
-               m.content_id, ai.image_id
+        SELECT m._id, m.bin_id, DATETIME(m.timestamp / 1000, 'unixepoch') AS timestamp,
+               CASE WHEN m.was_me = 1 THEN 'account owner' ELSE m.partner_jid END AS sender,
+               COALESCE(m.body, '[No Text]') AS body,
+               m.content_id, kc.content_name, ku.content_uri,
+               kc.content_string AS image_id
         FROM messagesTable m
-        LEFT JOIN AccountSwitcherImgBackupTable ai ON m.content_id = ai.image_id
-        WHERE m.bin_id LIKE '%@groups.kik.com';
+        LEFT JOIN KIKContentTable kc ON m.content_id = kc.content_id
+        LEFT JOIN KIKContentURITable ku ON m.content_id = ku.content_id
+        WHERE m.bin_id LIKE '%@groups.kik.com'
+        AND (kc.content_name = 'preview' OR kc.content_name IS NULL);
     """,
-
     "Images": """
-        SELECT CASE WHEN m.was_me = 1 THEN 'account owner' ELSE m.partner_jid END AS sender, 
-               m.content_id, ai.image_id
+        SELECT CASE WHEN m.was_me = 1 THEN 'account owner' ELSE m.partner_jid END AS sender,
+               m.content_id, kc.content_name, ku.content_uri,
+               kc.content_string AS image_id
         FROM messagesTable m
-        LEFT JOIN AccountSwitcherImgBackupTable ai ON m.content_id = ai.image_id;
+        LEFT JOIN KIKContentTable kc ON m.content_id = kc.content_id
+        LEFT JOIN KIKContentURITable ku ON m.content_id = ku.content_id
+        WHERE m.bin_id LIKE '%@talk.kik.com'
+        AND kc.content_name = 'preview';
     """
 }
 
+def scan_folder(scan_path):
+    backups = []
+    json_file = None
+    for file in os.listdir(scan_path):
+        full_path = os.path.join(scan_path, file)
+        if file.endswith(".backup"):
+            image_csv = os.path.join(scan_path, f"{file}_image_index.csv")
+            image_dir = os.path.join(scan_path, f"{file}_images")
+            if os.path.exists(image_csv) and os.path.exists(image_dir):
+                backups.append((full_path, image_csv, image_dir))
+            else:
+                if not os.path.exists(image_csv):
+                    logging.warning(f"Missing image index CSV: {image_csv}")
+                if not os.path.exists(image_dir):
+                    logging.warning(f"Missing image folder: {image_dir}")
+        elif file.endswith(".json") and json_file is None:
+            json_file = full_path
+    return backups, json_file
 
-def fetch_data_from_db(db_path, queries):
-    """Fetches data from the SQLite database and returns a dictionary of DataFrames."""
+def load_image_index(index_path):
+    image_map = {}
     try:
-        conn = sqlite3.connect(db_path)
-        data_frames = {key: pd.read_sql_query(query, conn) for key, query in queries.items()}
-        conn.close()
-        logging.info("Successfully fetched data from database.")
-        return data_frames
+        with open(index_path, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                image_id = str(row.get("image_id", "")).strip()
+                filename = row.get("filename", "").strip()
+                if image_id and filename:
+                    image_map[image_id] = filename
     except Exception as e:
-        logging.error(f"Error fetching data from database: {e}")
-        raise RuntimeError("Critical database error. Execution halted.")
+        logging.error(f"Error loading image index {index_path}: {e}")
+    return image_map
 
-
-def generate_html(data_frames, output_file, image_folder):
-    """Generates an HTML report with tab navigation and saves it to a file."""
+def load_category_map(json_path):
+    category_map = {}
     try:
-        html_content = """
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Kik Backup Report</title>
-            <style>
-                body { font-family: Arial, sans-serif; margin: 20px; }
-                .tab { display: none; }
-                .tab.active { display: block; }
-                .tabs { display: flex; cursor: pointer; }
-                .tab-button { padding: 10px; border: 1px solid #ddd; background: #f0f0f0; margin-right: 5px; }
-                table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
-                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-                th { background-color: #f4f4f4; }
-                img { max-width: 150px; height: auto; display: block; }
-            </style>
-            <script>
-                function showTab(tabId) {
-                    document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
-                    document.getElementById(tabId).classList.add('active');
-                }
-            </script>
-        </head>
-        <body>
-            <h1>Kik Backup Report</h1>
-            <div class="tabs">
-                <div class="tab-button" onclick="showTab('private_messages')">Private Messages</div>
-                <div class="tab-button" onclick="showTab('group_messages')">Group Messages</div>
-                <div class="tab-button" onclick="showTab('images')">Images</div>
-            </div>
-        """
-
-        for section, df in data_frames.items():
-            section_id = section.lower().replace(" ", "_")
-            html_content += f"<div id='{section_id}' class='tab'><h2>{section}</h2><table><tr>"
-            html_content += "".join(f"<th>{col}</th>" for col in df.columns)
-            html_content += "</tr>"
-
-            for _, row in df.iterrows():
-                html_content += "<tr>"
-                for col in df.columns:
-                    if col == "image_id" and pd.notna(row[col]):
-                        image_extensions = ['jpg', 'jpeg', 'png', 'gif']
-                        image_path = None
-                        for ext in image_extensions:
-                            potential_path = os.path.join(image_folder, f"{row[col]}.{ext}")
-                            if os.path.exists(potential_path):
-                                image_path = potential_path
-                                break
-                        if not image_path:
-                            image_path = 'Image Not Found'
-                            logging.warning(f"Missing image: {row[col]}")
-                        else:
-                            logging.info(f"Image found: {image_path}")
-                        html_content += f"<td><img src='{image_path}' alt='Image'></td>"
-                html_content += "</tr>"
-            html_content += "</table></div>"
-
-        html_content += "<script>showTab('private_messages');</script></body></html>"
-
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(html_content)
-
-        logging.info(f"HTML report successfully generated: {output_file}")
+        with open(json_path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        for entry in data.get("value", []):
+            for media in entry.get("Media", []):
+                category = str(media.get("Category", "")).strip()
+                for file in media.get("MediaFiles", []):
+                    fname = file.get("FileName", "").strip().lower()
+                    if fname:
+                        category_map[fname] = category
     except Exception as e:
-        logging.error(f"Error generating HTML report: {e}")
-        raise
+        logging.error(f"Error loading category JSON {json_path}: {e}")
+    return category_map
+
+def fetch_all_data(backups, category_map):
+    combined = {k: [] for k in QUERIES}
+    for db_path, csv_path, image_dir in backups:
+        label = os.path.basename(db_path)
+        image_index = load_image_index(csv_path)
+        try:
+            conn = sqlite3.connect(db_path)
+            for section, query in QUERIES.items():
+                df = pd.read_sql_query(query, conn)
+                df["source"] = label
+                df["image_path"] = df["image_id"].apply(
+                    lambda iid: os.path.join(os.path.basename(image_dir), image_index.get(str(iid).strip(), ""))
+                    if pd.notna(iid) else ""
+                )
+                df["category"] = df["image_id"].apply(
+                    lambda iid: category_map.get(image_index.get(str(iid).strip(), "").lower(), "")
+                    if pd.notna(iid) else ""
+                )
+                combined[section].append(df)
+            conn.close()
+        except Exception as e:
+            logging.error(f"Failed to query {db_path}: {e}")
+    return {k: pd.concat(v, ignore_index=True) if v else pd.DataFrame() for k, v in combined.items()}
+
+def render_html(data_frames, output_file):
+    env = Environment()
+    template = env.from_string("""
+    <!DOCTYPE html><html><head><meta charset="UTF-8"><title>Kik Report</title>
+    <style>
+    body { font-family: Arial; margin: 20px; }
+    .tabs { display: flex; margin-bottom: 10px; }
+    .tab-button { margin-right: 10px; padding: 8px; background: #eee; border: 1px solid #ccc; cursor: pointer; }
+    .tab { display: none; }
+    .tab.active { display: block; }
+    table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+    th { background: #f9f9f9; }
+    img { max-width: 150px; height: auto; display: block; }
+    </style><script>
+    function showTab(id) {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.getElementById(id).classList.add('active');
+    }
+    </script></head><body>
+    <h1>Kik Combined Report</h1>
+    {% if sections %}
+    <div class="tabs">{% for section in sections %}
+    <div class="tab-button" onclick="showTab('{{ section.id }}')">{{ section.name }}</div>
+    {% endfor %}</div>
+    {% for section in sections %}
+    <div class="tab" id="{{ section.id }}">
+        <h2>{{ section.name }}</h2>
+        <table><tr>{% for col in section.columns %}<th>{{ col }}</th>{% endfor %}<th>Image</th></tr>
+        {% for row in section.records %}
+        <tr>
+            {% for col in section.columns %}
+            <td>{{ row[col] }}</td>
+            {% endfor %}
+            <td>{% if row.image_path %}<img src="{{ row.image_path }}">{% endif %}</td>
+        </tr>
+        {% endfor %}</table></div>
+    {% endfor %}
+    <script>showTab('{{ sections[0].id }}');</script>
+    {% else %}
+    <p>No data available.</p>
+    {% endif %}
+    </body></html>
+    """)
+    sections = []
+    for name, df in data_frames.items():
+        if not df.empty:
+            records = df.to_dict(orient="records")
+            sections.append({
+                "id": name.lower().replace(" ", "_"),
+                "name": name,
+                "columns": df.columns.tolist(),
+                "records": records
+            })
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(template.render(sections=sections))
+    logging.info(f"HTML report saved to: {output_file}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("folder", help="Folder containing .backup, .csv, .json and image folders")
+    args = parser.parse_args()
+
+    backups, json_path = scan_folder(args.folder)
+    if not backups:
+        logging.error("No valid database/image index pairs found.")
+        sys.exit(1)
+
+    category_map = load_category_map(json_path)
+    combined = fetch_all_data(backups, category_map)
+
+    # 🟢 Output to the same directory as the first .backup file
+    first_db_path = backups[0][0]
+    db_dir = os.path.dirname(first_db_path)
+    output_path = os.path.join(db_dir, "Combined_Kik_Report.html")
+
+    render_html(combined, output_path)
+
 
 if __name__ == "__main__":
-    logging.info("Starting script execution...")
-    data_frames = fetch_data_from_db(DB_PATH, QUERIES)
-    if data_frames:
-        generate_html(data_frames, OUTPUT_HTML, IMAGE_FOLDER)
-    else:
-        logging.warning("No data extracted from the database.")
-    logging.info("Script execution finished.")
+    main()
