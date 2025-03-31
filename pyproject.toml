@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+exclude = ["debian*", "binaries*", "build*", "dist*", "archive*"]
+
+[project]
+name = "blue-kik-parser"
+version = "1.0.0"
+dependencies = [
+    "pandas",
+    "Pillow",
+    "openpyxl"
+]
+requires-python = ">=3.9"
+authors = [
+  {name = "Marcus Penn (marcuspenn4n6)", email = "none_yet@none.yet"}
+]
+maintainers = [
+  {name = "Marcus Penn (marcuspenn4n6)", email = "none_yet@none.yet"}
+]
+description = "Python parser for the Blue Kik Messenger"
+readme = "README.md"
+keywords = ["digital forensics", "dfir", "blue", "kik", "parse"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent"
+]
+
+[project.urls]
+Homepage = "https://github.com/marcuspenn4n6/Blue-Kik-Parser"
+
+[project.scripts]
+blue-kik-parser = "blue_kik_parser.blue_kik_parser:main"
