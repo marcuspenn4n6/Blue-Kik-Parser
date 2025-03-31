@@ -1,7 +1,7 @@
 # Blue Kik Parser
 
 ## Overview
-Blue Kik Parser is a Python-based tool designed to extract messages, images, and content metadata from Blue Kik Messenger SQLite database backups. It supports batch processing and structured data export to Excel files for analysis.
+Blue Kik Parser is a Python-based tool designed to extract messages, images, and content metadata from Blue Kik Messenger SQLite database backups. It supports batch processing and structured data export to Excel files for analysis. HTML data export is a work in progress.
 
 ## Features
 - Extracts private messages, group messages, and image metadata.
